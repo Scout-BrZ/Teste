@@ -1,0 +1,570 @@
+diff --git a/Sunrise/resources/resource.h b/Sunrise/resources/resource.h
+--- a/Sunrise/resources/resource.h
++++ b/Sunrise/resources/resource.h
+@@ -33,11 +33,11 @@
+ 
+ /** The four numeric fields of the version resource, in FILEVERSION order. */
+ #define SUNRISE_VER_MAJOR 0
+-#define SUNRISE_VER_MINOR 4
+-#define SUNRISE_VER_PATCH 0
++#define SUNRISE_VER_MINOR 5
++#define SUNRISE_VER_PATCH 1
+ #define SUNRISE_VER_BUILD 0
+ /** The same version as display text. Windows shows this string, not the four fields. */
+-#define SUNRISE_VER_STRING "0.4.0.0"
++#define SUNRISE_VER_STRING "0.5.1.0"
+ 
+ /** SQLite schema, default rows, and upstream notice are embedded in the DLL. */
+ #define IDR_INVESTMENT_SCHEMA 106
+diff --git a/Sunrise/src/client/content/activity/activity_sdk_lua_contract.cpp b/Sunrise/src/client/content/activity/activity_sdk_lua_contract.cpp
+--- a/Sunrise/src/client/content/activity/activity_sdk_lua_contract.cpp
++++ b/Sunrise/src/client/content/activity/activity_sdk_lua_contract.cpp
+@@ -240,6 +240,7 @@
+             R"lua(enabled: boolean}): SunriseRequestKey
+ ---@field bind_combatant_to_squad fun(self: SunriseSlot): SunriseRequestKey
+ ---@field transition fun(SunriseSlot, SunriseDeviceTransitionArguments): SunriseRequestKey
++---@field set_authored_channels fun(self: SunriseSlot, args: {values: number[], blend: number?}): SunriseRequestKey
+ ---@field fire_trigger fun(self: SunriseSlot): SunriseRequestKey
+ ---@field sequences fun(self: SunriseSlot): SunriseActorSequences
+ ---@field play_sequence fun(self: SunriseSlot, args: {sequence: SunriseActorSequence}): )lua"
+diff --git a/Sunrise/src/middleware/bap/activity_message/activity_scriptable_auth_fixed_body_codec.cpp b/Sunrise/src/middleware/bap/activity_message/activity_scriptable_auth_fixed_body_codec.cpp
+--- a/Sunrise/src/middleware/bap/activity_message/activity_scriptable_auth_fixed_body_codec.cpp
++++ b/Sunrise/src/middleware/bap/activity_message/activity_scriptable_auth_fixed_body_codec.cpp
+@@ -400,4 +400,111 @@
+     return bitCount == kType35BitCount && decode_type35_body(input, body);
+ }
+ 
++/** Reserva revisões positivas sem permitir retorno a zero por estouro. */
++bool next_type24_revision(const Type24RevisionGuard& guard, std::int32_t& next) noexcept {
++    next = 0;
++    if (guard.hasLast && guard.last < 0) {
++        return false;
++    }
++    if (guard.hasLast && guard.last >= (std::numeric_limits<std::int32_t>::max)()) {
++        return false;
++    }
++    next = guard.hasLast ? static_cast<std::int32_t>(guard.last + 1) : 1;
++    return next > 0;
++}
++
++/** Codifica somente os canais declarados, após validar todos os valores. */
++bool encode_type24(const Type24Body& body, std::span<std::byte> output,
++                   std::size_t& written, std::size_t& writtenBits) noexcept {
++    written = 0;
++    writtenBits = 0;
++    if (body.count > kType24ChannelCapacity) {
++        return false;
++    }
++    const std::size_t bits = kType24CountWidth + body.count * kType24ChannelBitCount;
++    const std::size_t bytes = (bits + 7U) / 8U;
++    if (output.size() < bytes) {
++        return false;
++    }
++    for (const auto& channel : std::span(body.channels).first(body.count)) {
++        if (channel.revision < 0 || !std::isfinite(channel.value)
++            || channel.value < kType24MinimumValue || channel.value > kType24MaximumValue
++            || !std::isfinite(channel.blend) || channel.blend < 0.F) {
++            return false;
++        }
++    }
++    encoding::bits::Writer writer(output.first(bytes));
++    bool encoded = writer.write(body.count, kType24CountWidth);
++    for (const auto& channel : std::span(body.channels).first(body.count)) {
++        encoded = encoded
++                  && writer.write(std::bit_cast<std::uint32_t>(channel.revision) + kSigned32Bias,
++                                  kSigned32Width)
++                  && writer.write(std::bit_cast<std::uint32_t>(channel.value), kReal32Width)
++                  && writer.write(std::bit_cast<std::uint32_t>(channel.blend), kReal32Width);
++    }
++    if (!encoded || !writer.finish(written)) {
++        written = 0;
++        return false;
++    }
++    writtenBits = bits;
++    return true;
++}
++
++/** Rejeita mensagens truncadas, canais inválidos e bits de preenchimento não nulos. */
++bool decode_type24_body(std::span<const std::byte> input, Type24Body& body) noexcept {
++    body = {};
++    if (input.empty() || input.size() > kType24MaximumByteCount) {
++        return false;
++    }
++    encoding::bits::Reader reader(input);
++    std::uint64_t count = 0;
++    if (!reader.read(kType24CountWidth, count) || count > kType24ChannelCapacity) {
++        return false;
++    }
++    const std::size_t bits = kType24CountWidth + static_cast<std::size_t>(count) * kType24ChannelBitCount;
++    if (input.size() != (bits + 7U) / 8U) {
++        return false;
++    }
++    Type24Body parsed{};
++    parsed.count = static_cast<std::uint8_t>(count);
++    for (std::size_t index = 0; index < parsed.count; ++index) {
++        std::uint64_t revisionBits = 0;
++        std::uint64_t valueBits = 0;
++        std::uint64_t blendBits = 0;
++        if (!reader.read(kSigned32Width, revisionBits)
++            || !reader.read(kReal32Width, valueBits)
++            || !reader.read(kReal32Width, blendBits)) {
++            return false;
++        }
++        const std::uint32_t rawRevision = static_cast<std::uint32_t>(revisionBits) - kSigned32Bias;
++        const std::int32_t revision = std::bit_cast<std::int32_t>(rawRevision);
++        const float value = std::bit_cast<float>(static_cast<std::uint32_t>(valueBits));
++        const float blend = std::bit_cast<float>(static_cast<std::uint32_t>(blendBits));
++        if (revision < 0 || !std::isfinite(value) || value < kType24MinimumValue
++            || value > kType24MaximumValue || !std::isfinite(blend) || blend < 0.F) {
++            return false;
++        }
++        parsed.channels[index] = {revision, value, blend};
++    }
++    if (!finish_padding(reader)) {
++        return false;
++    }
++    body = parsed;
++    return true;
++}
++
++/** Verifica o tamanho exato em bits, além da estrutura da mensagem. */
++bool validate_type24_body(std::span<const std::byte> input, std::size_t bitCount) noexcept {
++    if (bitCount < kType24CountWidth || bitCount > kType24MaximumBitCount) {
++        return false;
++    }
++    Type24Body body{};
++    if (!decode_type24_body(input, body)) {
++        return false;
++    }
++    return bitCount == kType24CountWidth
++                                + static_cast<std::size_t>(body.count) * kType24ChannelBitCount;
++}
++
++
+ } // namespace sunrise::middleware::bap::activity_message::scriptable_auth
+diff --git a/Sunrise/src/middleware/bap/activity_message/scriptable_auth_body.h b/Sunrise/src/middleware/bap/activity_message/scriptable_auth_body.h
+--- a/Sunrise/src/middleware/bap/activity_message/scriptable_auth_body.h
++++ b/Sunrise/src/middleware/bap/activity_message/scriptable_auth_body.h
+@@ -202,6 +202,42 @@
+                                      std::span<std::byte> output,
+                                      std::size_t& written,
+                                      std::size_t& writtenBits) noexcept;
++
++/** Canais autorais: contador de três bits seguido por até quatro registros de 96 bits. */
++inline constexpr std::uint8_t kType24SlotType = 24;
++inline constexpr std::uint32_t kType24Schema = 0x80804F40U;
++inline constexpr std::uint8_t kType24CountWidth = 3;
++inline constexpr std::size_t kType24ChannelCapacity = 4;
++inline constexpr std::size_t kType24ChannelBitCount = 96;
++inline constexpr std::size_t kType24MaximumBitCount = 387;
++inline constexpr std::size_t kType24MaximumByteCount = 49;
++inline constexpr float kType24MinimumValue = -100.F;
++inline constexpr float kType24MaximumValue = 100.F;
++/** Revisão definida pelo host, valor do canal e duração da interpolação. */
++struct Type24Channel final {
++    std::int32_t revision{};
++    float value{};
++    float blend{};
++};
++/** Apenas os primeiros count canais são transmitidos. */
++struct Type24Body final {
++    std::array<Type24Channel, kType24ChannelCapacity> channels{};
++    std::uint8_t count{};
++};
++/** Última revisão confirmada para a referência exata de um slot. */
++struct Type24RevisionGuard final {
++    std::int32_t last{};
++    bool hasLast{};
++};
++/** Calcula a próxima revisão positiva e recusa o estouro de int32. */
++[[nodiscard]] bool next_type24_revision(const Type24RevisionGuard& guard, std::int32_t& next) noexcept;
++/** Valida e serializa os canais, informando os tamanhos em bytes e bits. */
++[[nodiscard]] bool encode_type24(const Type24Body& body, std::span<std::byte> output,
++                                 std::size_t& written, std::size_t& writtenBits) noexcept;
++/** Decodifica uma mensagem completa e exige preenchimento final com zeros. */
++[[nodiscard]] bool decode_type24_body(std::span<const std::byte> input, Type24Body& body) noexcept;
++/** Confere também se a quantidade declarada de bits corresponde aos canais. */
++[[nodiscard]] bool validate_type24_body(std::span<const std::byte> input, std::size_t bitCount) noexcept;
+ 
+ /** ClientRef slot type and Auth schema for the object-filter sensor. */
+ inline constexpr std::uint8_t kType34SlotType = 34;
+diff --git a/Sunrise/src/server/activity/activity_sdk_device_prepare.cpp b/Sunrise/src/server/activity/activity_sdk_device_prepare.cpp
+--- a/Sunrise/src/server/activity/activity_sdk_device_prepare.cpp
++++ b/Sunrise/src/server/activity/activity_sdk_device_prepare.cpp
+@@ -476,6 +476,9 @@
+         || typed(
+             format::kSquadSlotType, format::kSquadComponentClass, message::squad_objective::kSchema)
+         || typed(auth::kType2SlotType, auth::kType2ComponentClass, auth::kType2Schema);
++    const bool type24 = slotType == auth::kType24SlotType
++                        && authSchema == auth::kType24Schema
++                        && auth::validate_type24_body(body, bitCount);
+     const bool occupancy = slotType == format::kOccupancySlotType
+                            && authSchema == format::kOccupancyAuthSchema
+                            && bitCount == kOccupancyAuthBits && body.size() == kOccupancyAuthBytes;
+@@ -499,7 +502,7 @@
+         slotType == middleware::bap::activity_message::scriptable_auth::kType2SlotType
+         && authSchema == middleware::bap::activity_message::scriptable_auth::kType2Schema
+         && middleware::bap::activity_message::scriptable_auth::validate_type2_body(body, bitCount);
+-    if (!typedSdkBody && !occupancy && !directive && !engagement && !publicEvent && !performance
++    if (!typedSdkBody && !type24 && !occupancy && !directive && !engagement && !publicEvent && !performance
+         && !combatant) {
+         return Status::invalidBody;
+     }
+diff --git a/Sunrise/src/server/activity/host_runtime.h b/Sunrise/src/server/activity/host_runtime.h
+--- a/Sunrise/src/server/activity/host_runtime.h
++++ b/Sunrise/src/server/activity/host_runtime.h
+@@ -256,6 +256,8 @@
+     authoredSceneEvent,
+     authoredSceneStop,
+     combatantSequence,
++    /** Canais de saída autorais com revisão controlada pelo host. */
++    type24,
+ };
+ 
+ /** Current diagnostic state of one retained incident. */
+diff --git a/Sunrise/src/server/activity/host_runtime_internal.h b/Sunrise/src/server/activity/host_runtime_internal.h
+--- a/Sunrise/src/server/activity/host_runtime_internal.h
++++ b/Sunrise/src/server/activity/host_runtime_internal.h
+@@ -113,6 +113,7 @@
+     middleware::bap::activity_message::scriptable_auth::Type5RevisionGuard type5{};
+     middleware::bap::activity_message::scriptable_auth::Type6GenerationGuard type6{};
+     middleware::bap::activity_message::scriptable_auth::Type23SequenceGuard type23{};
++    middleware::bap::activity_message::scriptable_auth::Type24RevisionGuard type24{};
+     middleware::bap::activity_message::scriptable_auth::Type31GenerationGuard type31{};
+     middleware::bap::activity_message::scriptable_auth::Type3GenerationGuard type3{};
+     middleware::bap::activity_message::scriptable_auth::Type38GenerationGuard type38{};
+diff --git a/Sunrise/src/server/activity/host_runtime_scriptable.cpp b/Sunrise/src/server/activity/host_runtime_scriptable.cpp
+--- a/Sunrise/src/server/activity/host_runtime_scriptable.cpp
++++ b/Sunrise/src/server/activity/host_runtime_scriptable.cpp
+@@ -562,6 +562,46 @@
+                   && auth::encode_type53(
+                       {request.dialogueCue, sequence}, candidate.type53, pending.body, written);
+         pending.dialogueSequence = sequence;
++    } else if (encoded && request.kind == ScriptableOverrideKind::type24) {
++        // Parte da maior revisão já enviada para que o cliente aceite a atualização.
++        auth::Type24Body body{};
++        auth::Type24RevisionGuard composedGuard = candidate.type24;
++        for (const auto& retained : instance->scriptableAuthEstate) {
++            if (!same_client_ref(retained.target, request.target)
++                || retained.bitCount < auth::kType24CountWidth
++                || retained.byteCount == 0) {
++                continue;
++            }
++            auth::Type24Body source{};
++            if (!auth::decode_type24_body(std::span(retained.body).first(retained.byteCount), source)) {
++                continue;
++            }
++            for (std::size_t index = 0; index < source.count; ++index) {
++                const auto revision = source.channels[index].revision;
++                if (!composedGuard.hasLast || revision > composedGuard.last) {
++                    composedGuard.last = revision;
++                    composedGuard.hasLast = true;
++                }
++            }
++            break;
++        }
++        std::int32_t revision = 0;
++        encoded = auth::next_type24_revision(composedGuard, revision)
++                  && auth::decode_type24_body(
++                      std::span(request.authBody).first(request.authByteCount), body);
++        if (encoded) {
++            for (std::size_t index = 0; index < body.count; ++index) {
++                // Todos os canais deste comando compartilham a revisão criada pelo host.
++                body.channels[index].revision = revision;
++            }
++            encoded = auth::encode_type24(body, pending.body, written, writtenBits);
++        }
++        if (writtenBits <= (std::numeric_limits<std::uint16_t>::max)()) {
++            pending.bitCount = static_cast<std::uint16_t>(writtenBits);
++        } else {
++            encoded = false;
++        }
++        pending.generation = static_cast<std::uint64_t>(revision);
+     } else if (encoded && request.kind == ScriptableOverrideKind::sdkAuth) {
+         written = request.authByteCount;
+         pending.bitCount = request.authBitCount;
+diff --git a/Sunrise/src/server/activity/host_runtime_scriptable_requests.cpp b/Sunrise/src/server/activity/host_runtime_scriptable_requests.cpp
+--- a/Sunrise/src/server/activity/host_runtime_scriptable_requests.cpp
++++ b/Sunrise/src/server/activity/host_runtime_scriptable_requests.cpp
+@@ -463,7 +463,15 @@
+     request.authBitCount = bitCount;
+     request.authByteCount = static_cast<std::uint16_t>(body.size());
+     request.expectedActivityClientGeneration = expectedActivityClientGeneration;
+-    request.kind = ScriptableOverrideKind::sdkAuth;
++    if (target.slotType == auth::kType24SlotType) {
++        // A rota genérica desta versão identifica aqui os canais com revisão própria.
++        if (target.authSchema != auth::kType24Schema || !auth::validate_type24_body(body, bitCount)) {
++            return false;
++        }
++        request.kind = ScriptableOverrideKind::type24;
++    } else {
++        request.kind = ScriptableOverrideKind::sdkAuth;
++    }
+     return enqueue_request(request, reservation);
+ }
+ 
+diff --git a/Sunrise/src/server/activity/host_runtime_scriptable_staging.cpp b/Sunrise/src/server/activity/host_runtime_scriptable_staging.cpp
+--- a/Sunrise/src/server/activity/host_runtime_scriptable_staging.cpp
++++ b/Sunrise/src/server/activity/host_runtime_scriptable_staging.cpp
+@@ -156,6 +156,12 @@
+         std::int16_t next = 0;
+         nextCounter = auth::next_type23_sequence(guard->type23, pending.channel, next)
+                       && next == pending.sequence;
++    } else if (guard != nullptr && pending.kind == ScriptableOverrideKind::type24) {
++        // O estado retido pode estar à frente do contador local; a revisão deve avançar.
++        std::int32_t next = 0;
++        nextCounter = auth::next_type24_revision(guard->type24, next)
++                      && pending.generation >= static_cast<std::uint64_t>(next)
++                      && pending.generation <= static_cast<std::uint64_t>((std::numeric_limits<std::int32_t>::max)());
+     } else if (guard != nullptr && pending.kind == ScriptableOverrideKind::type31) {
+         std::uint64_t next = 0;
+         nextCounter =
+@@ -217,6 +223,10 @@
+         guard->type42.hasLast = true;
+     } else if (pending.kind == ScriptableOverrideKind::type23) {
+         guard->type23.last[static_cast<std::size_t>(pending.channel)] = pending.sequence;
++    } else if (pending.kind == ScriptableOverrideKind::type24) {
++        // Confirma a revisão somente depois que o transporte aceita a mensagem.
++        guard->type24.last = static_cast<std::int32_t>(pending.generation);
++        guard->type24.hasLast = true;
+     } else if (pending.kind == ScriptableOverrideKind::type31) {
+         guard->type31.last = pending.generation;
+         guard->type31.hasLast = true;
+diff --git a/Sunrise/src/server/activity/mission/mission_script_lua_slot_api.cpp b/Sunrise/src/server/activity/mission/mission_script_lua_slot_api.cpp
+--- a/Sunrise/src/server/activity/mission/mission_script_lua_slot_api.cpp
++++ b/Sunrise/src/server/activity/mission/mission_script_lua_slot_api.cpp
+@@ -1004,6 +1004,81 @@
+     }
+     return queue_intent(state, frame, intent);
+ }
++
++/** Aceita somente um sensor de canais tipo 24 com associação exata de schemas. */
++[[nodiscard]] bool exact_authored_channel_slot(const SlotDefinition& definition) noexcept {
++    return definition.slotType == scriptable_auth::kType24SlotType
++           && definition.authSchema == scriptable_auth::kType24Schema
++           && (definition.flags & format::kSlotSchemaJoinExact) != 0;
++}
++
++/** Substitui todos os canais autorais de saída do sensor tipo 24. */
++[[nodiscard]] int slot_set_authored_channels(lua_State* state) {
++    const auto* const handle =
++        static_cast<const SlotHandle*>(luaL_checkudata(state, 1, kSlotMetatable));
++    SlotDefinition slot{};
++    if (!current_slot(state, *handle, slot)) {
++        return luaL_error(state, "activity slot is stale or invalid");
++    }
++    if (!exact_authored_channel_slot(slot)) {
++        return luaL_error(state, "activity slot is not an exact type-24 channel sensor");
++    }
++    static constexpr std::array<std::string_view, 2> kDeclared{"values", "blend"};
++    refuse_unknown_arguments(state, kDeclared);
++
++    lua_getfield(state, 2, "values");
++    luaL_checktype(state, -1, LUA_TTABLE);
++    const int list = lua_gettop(state);
++    const std::size_t count = lua_rawlen(state, list);
++    if (count == 0 || count > scriptable_auth::kType24ChannelCapacity) {
++        lua_pop(state, 1);
++        return luaL_error(state, "values must contain one to four channel numbers");
++    }
++
++    const lua_Number blendNumber = [&]() -> lua_Number {
++        lua_getfield(state, 2, "blend");
++        const lua_Number result = lua_isnil(state, -1) ? 0.0 : luaL_checknumber(state, -1);
++        lua_pop(state, 1);
++        return result;
++    }();
++    const float blend = static_cast<float>(blendNumber);
++    if (!std::isfinite(blend) || blend < 0.F) {
++        lua_pop(state, 1);
++        return luaL_error(state, "blend must be a finite non-negative number");
++    }
++
++    scriptable_auth::Type24Body body{};
++    body.count = static_cast<std::uint8_t>(count);
++    for (std::size_t index = 0; index < count; ++index) {
++        lua_rawgeti(state, list, static_cast<lua_Integer>(index + 1));
++        if (!lua_isnumber(state, -1)) {
++            lua_pop(state, 2);
++            return luaL_error(state, "values must contain numbers");
++        }
++        const float value = static_cast<float>(lua_tonumber(state, -1));
++        lua_pop(state, 1);
++        if (!std::isfinite(value) || value < scriptable_auth::kType24MinimumValue
++            || value > scriptable_auth::kType24MaximumValue) {
++            lua_pop(state, 1);
++            return luaL_error(state, "channel values must be finite numbers in [-100, 100]");
++        }
++        body.channels[index] = {0, value, blend};
++    }
++    lua_pop(state, 1);
++
++    std::array<std::byte, scriptable_auth::kType24MaximumByteCount> bytes{};
++    std::size_t written = 0;
++    std::size_t bits = 0;
++    if (!scriptable_auth::encode_type24(body, bytes, written, bits)) {
++        return luaL_error(state, "type-24 channel encoder failed");
++    }
++    return queue_slot_auth(state,
++                           slot,
++                           scriptable_auth::kType24Schema,
++                           bits,
++                           std::span(bytes).first(written));
++}
++
+ 
+ /** Sets one verified type-23 channel through the same guarded route. */
+ [[nodiscard]] int slot_set_channel(lua_State* state) {
+@@ -1344,6 +1419,8 @@
+         lua_pushcfunction(state, &slot_watch_damage);
+     } else if (key == "set_object_active") {
+         lua_pushcfunction(state, &slot_set_object_active);
++    } else if (key == "set_authored_channels") {
++        lua_pushcfunction(state, &slot_set_authored_channels);
+     } else if (key == "set_channel") {
+         lua_pushcfunction(state, &slot_set_channel);
+     } else if (key == "transition") {
+diff --git a/tests/type24_codec_test.cpp b/tests/type24_codec_test.cpp
+--- /dev/null
++++ b/tests/type24_codec_test.cpp
+@@ -0,0 +1,67 @@
++#include <array>
++#include <cassert>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <limits>
++#include "middleware/bap/activity_message/scriptable_auth_body.h"
++
++namespace auth = sunrise::middleware::bap::activity_message::scriptable_auth;
++
++int main() {
++    std::array<std::byte, auth::kType24MaximumByteCount> bytes{};
++    std::size_t written = 0, bits = 0;
++    auth::Type24Body body{}, decoded{};
++    for (std::uint8_t count = 0; count <= 4; ++count) {
++        body.count = count;
++        for (std::size_t i = 0; i < count; ++i) {
++            body.channels[i] = {static_cast<std::int32_t>(i + 1), i % 2 ? -100.F : 100.F, 0.25F};
++        }
++        assert(auth::encode_type24(body, bytes, written, bits));
++        assert(bits == 3U + count * 96U && written == (bits + 7U) / 8U);
++        const auto packed = std::span(bytes).first(written);
++        assert(auth::validate_type24_body(packed, bits));
++        assert(!auth::validate_type24_body(packed, bits + 1));
++        assert(auth::decode_type24_body(packed, decoded) && decoded.count == count);
++        for (std::size_t i = 0; i < count; ++i) {
++            assert(decoded.channels[i].revision == body.channels[i].revision);
++            assert(decoded.channels[i].value == body.channels[i].value);
++            assert(decoded.channels[i].blend == body.channels[i].blend);
++        }
++        assert(!auth::decode_type24_body(packed.first(written - 1), decoded));
++        bytes[written - 1] |= std::byte{1};
++        assert(!auth::decode_type24_body(packed, decoded));
++    }
++    body.count = 5;
++    assert(!auth::encode_type24(body, bytes, written, bits) && written == 0 && bits == 0);
++    body.count = 1;
++    for (float bad : {101.F, -101.F, std::numeric_limits<float>::infinity(),
++                      std::numeric_limits<float>::quiet_NaN()}) {
++        body.channels[0] = {1, bad, 0.F};
++        assert(!auth::encode_type24(body, bytes, written, bits));
++    }
++    for (float bad : {-1.F, std::numeric_limits<float>::infinity(),
++                      std::numeric_limits<float>::quiet_NaN()}) {
++        body.channels[0] = {1, 0.F, bad};
++        assert(!auth::encode_type24(body, bytes, written, bits));
++    }
++    body.channels[0] = {-1, 0.F, 0.F};
++    assert(!auth::encode_type24(body, bytes, written, bits));
++    body.channels[0] = {0, 0.F, 0.F};
++    assert(!auth::encode_type24(body, std::span(bytes).first(12), written, bits));
++    assert(auth::encode_type24(body, bytes, written, bits));
++    // Vetor independente: um canal, revisão deslocada para 0x80000000 e dois floats zero.
++    assert(written == 13 && bytes[0] == std::byte{0x30});
++    for (std::size_t i = 1; i < written; ++i) assert(bytes[i] == std::byte{0});
++    bytes[0] = std::byte{0x20}; // Revisão negativa no formato de transmissão.
++    assert(!auth::decode_type24_body(std::span(bytes).first(written), decoded));
++    bytes[0] = std::byte{0xA0}; // Cinco canais excedem a capacidade de quatro.
++    assert(!auth::decode_type24_body(std::span(bytes).first(written), decoded));
++    std::int32_t next = 0;
++    assert(auth::next_type24_revision({}, next) && next == 1);
++    assert(auth::next_type24_revision({42, true}, next) && next == 43);
++    assert(auth::next_type24_revision({INT32_MAX - 1, true}, next) && next == INT32_MAX);
++    assert(!auth::next_type24_revision({INT32_MAX, true}, next) && next == 0);
++    assert(!auth::next_type24_revision({-1, true}, next) && next == 0);
++    std::puts("Codec tipo 24: todos os testes passaram.");
++}
+diff --git a/tests/run_type24_codec_test.cmd b/tests/run_type24_codec_test.cmd
+--- /dev/null
++++ b/tests/run_type24_codec_test.cmd
+@@ -0,0 +1,13 @@
++@echo off
++setlocal
++rem Usa o compilador de 64 bits e grava os artefatos de teste dentro de build.
++call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
++if errorlevel 1 exit /b 1
++pushd "%~dp0.."
++if not exist build\type24-tests mkdir build\type24-tests
++cl /nologo /utf-8 /std:c++20 /EHsc /W4 /WX /Gy /I Sunrise\src tests\type24_codec_test.cpp Sunrise\src\middleware\bap\activity_message\activity_scriptable_auth_fixed_body_codec.cpp Sunrise\src\middleware\encoding\bit_reader.cpp Sunrise\src\middleware\encoding\bit_writer.cpp /Fo:build\type24-tests\ /Fe:build\type24-tests\type24_codec_test.exe /link /OPT:REF
++if errorlevel 1 exit /b 1
++build\type24-tests\type24_codec_test.exe
++set result=%errorlevel%
++popd
++exit /b %result%
+diff --git a/ALTERACOES_TYPE24.md b/ALTERACOES_TYPE24.md
+--- /dev/null
++++ b/ALTERACOES_TYPE24.md
+@@ -0,0 +1,52 @@
++# Suporte aos canais autorais tipo 24
++
++As alterações foram adaptadas ao código desta pasta. Os arquivos anteriores à aplicação estão em `backup-before-type24`, com a mesma estrutura de diretórios.
++
++## O que mudou
++
++| Arquivo | Alteração |
++| --- | --- |
++| `Sunrise/src/middleware/bap/activity_message/scriptable_auth_body.h` | Estruturas dos canais tipo 24, limites do protocolo, controle de revisão e declarações do codec. |
++| `Sunrise/src/middleware/bap/activity_message/activity_scriptable_auth_fixed_body_codec.cpp` | Codificação, decodificação e validação do corpo tipo 24; avanço da revisão sem estouro. |
++| `Sunrise/src/server/activity/mission/mission_script_lua_slot_api.cpp` | Implementação e registro de `slot:set_authored_channels`. |
++| `Sunrise/src/client/content/activity/activity_sdk_lua_contract.cpp` | Declaração da nova API no contrato Lua gerado. |
++| `Sunrise/src/server/activity/activity_sdk_device_prepare.cpp` | Aceitação de mensagens tipo 24 válidas na preparação do comando. |
++| `Sunrise/src/server/activity/host_runtime.h` | Novo tipo de comando, acrescentado ao final do enum para preservar os valores existentes. |
++| `Sunrise/src/server/activity/host_runtime_internal.h` | Controle da última revisão tipo 24 por slot. |
++| `Sunrise/src/server/activity/host_runtime_scriptable_requests.cpp` | Identificação e validação dos comandos tipo 24 na entrada do host. |
++| `Sunrise/src/server/activity/host_runtime_scriptable.cpp` | Criação de uma revisão superior às revisões locais e retidas; aplicação da mesma revisão a todos os canais do comando. |
++| `Sunrise/src/server/activity/host_runtime_scriptable_staging.cpp` | Confirmação da revisão após aceitação pelo transporte. |
++| `Sunrise/resources/resource.h` | Metadados de versão alterados de `0.4.0.0` para `0.5.1.0`. |
++
++Os comentários acrescentados estão em português do Brasil. Os comentários anteriores permanecem como estavam.
++
++## Uso em Lua
++
++```lua
++-- O slot precisa ser um sensor autoral tipo 24, válido no SDK carregado.
++-- O comando substitui o conjunto completo dos canais de saída.
++local pedido = slot:set_authored_channels({
++    values = {100, 0, -50},
++    blend = 0,
++})
++```
++
++`values` recebe de um a quatro valores finitos entre -100 e 100. `blend` é opcional, assume zero e deve ser finito e não negativo. A revisão é definida pelo host; o script não a escolhe. O comando segue a fila e a confirmação de transporte já utilizadas pelo projeto.
++
++## Adaptações em relação ao patch original
++
++- Esta árvore não tinha o codec básico tipo 24; ele foi incluído a partir do formato de três bits de contagem e registros de 96 bits, compatível com o catálogo existente.
++- A API Lua foi colocada em `mission_script_lua_slot_api.cpp`, onde esta versão concentra as APIs de slots. Não foi necessário criar o arquivo separado usado pelo patch.
++- A identidade do slot usa o tipo 24, o schema Auth `0x80804F40` e a associação exata de schemas produzida pelo SDK desta árvore, que resolve componente e Sense dinamicamente.
++- O encaminhamento para o comando tipo 24 ocorre em `request_sdk_auth_override`; assim, não é necessário mudar a assinatura das APIs de despacho desta versão.
++- A confirmação aceita uma revisão maior que o contador local quando o estado retido já estava à frente. Isso acompanha a lógica de composição do próprio patch e evita impedir a confirmação de um comando válido.
++
++## Versão exibida
++
++Antes da aplicação, `resource.h` já declarava `0.4.0.0`. Esse mesmo valor alimenta os metadados do Windows e a versão exibida na interface. O ajuste para `0.5.1.0` acompanha o nome desta pasta; não comprova, por si só, a origem ou a versão funcional de todos os arquivos do projeto.
++
++## Testes
++
++Execute `tests\run_type24_codec_test.cmd` para verificar o codec com o Visual Studio instalado. Os testes cobrem quantidades de canais, limites numéricos, valores não finitos, revisão negativa, estouro de revisão, buffer insuficiente, mensagem truncada, preenchimento inválido e um vetor de bytes independente.
++
++A validação em jogo ainda precisa ser feita com um slot tipo 24 real do SDK correspondente.
